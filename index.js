@@ -83,6 +83,7 @@ function waitFor(ws, wantType, timeoutMs = 12000) {
 async function syncAccount({ host, clientId, clientSecret, accessToken, ctidAccountId, fromTimestamp, toTimestamp }) {
   const ws = await connectWS(host);
   try {
+    // ── App + account auth ──────────────────────────────────────────────────
     sendMsg(ws, 2100, { clientId, clientSecret });
     await waitFor(ws, 2101);
     console.log('[sync] App auth OK');
@@ -91,10 +92,28 @@ async function syncAccount({ host, clientId, clientSecret, accessToken, ctidAcco
     await waitFor(ws, 2103);
     console.log('[sync] Account auth OK');
 
-    // Symbol names come directly from deal.symbol field — no separate lookup needed
-    const symbols = {};
-    console.log('[sync] Skipping symbol list (names in deal objects)');
+    // ── Symbol list → names ─────────────────────────────────────────────────
+    // cTrader deals contain symbolId (integer), NOT a symbol name string.
+    // We must fetch the symbol list first to build id→name and id→lotSize maps.
+    const symbols  = {};  // symbolId → name  (returned to PHP as 'symbols')
+    const lotSizes = {};  // symbolId → lotSize (returned to PHP as 'lotSizes')
 
+    try {
+      sendMsg(ws, 2119, { ctidTraderAccountId: ctidAccountId, includeArchivedSymbols: false });
+      const symRes = await waitFor(ws, 2120, 20000);
+      const symList = symRes.payload?.symbol ?? symRes.payload?.symbols ?? [];
+      for (const s of symList) {
+        const id   = Number(s.symbolId ?? s.id ?? 0);
+        const name = s.symbolName ?? s.name ?? null;
+        if (id && name) symbols[id] = name;
+      }
+      console.log(`[sync] Symbol list: ${Object.keys(symbols).length} symbols`);
+    } catch (e) {
+      // Non-fatal — deals may still have symbol field or we fall back to SYM{id}
+      console.warn(`[sync] Symbol list failed (non-fatal): ${e.message}`);
+    }
+
+    // ── Fetch deals in pages ────────────────────────────────────────────────
     const allDeals = [];
     let   pageFrom = fromTimestamp;
     let   pages    = 0;
@@ -110,9 +129,37 @@ async function syncAccount({ host, clientId, clientSecret, accessToken, ctidAcco
       pageFrom = Math.max(...deals.map(d => Number(d.executionTimestamp))) + 1;
       if (pageFrom >= toTimestamp) break;
     }
+    console.log(`[sync] Deals total: ${allDeals.length}`);
 
-    console.log(`[sync] Done: ${allDeals.length} deals`);
-    return { deals: allDeals, symbols, pages, total: allDeals.length };
+    // ── Symbol details → lotSizes for symbols found in deals ────────────────
+    // lotSize is needed to correctly convert volume (units) → lots.
+    // e.g. EURUSD lotSize=100000, so volume 300000 = 3.00 lots.
+    const uniqueIds = [...new Set(allDeals.map(d => Number(d.symbolId ?? 0)).filter(Boolean))];
+    if (uniqueIds.length) {
+      try {
+        // Send in chunks of 50
+        for (let i = 0; i < uniqueIds.length; i += 50) {
+          const chunk = uniqueIds.slice(i, i + 50);
+          sendMsg(ws, 2125, { ctidTraderAccountId: ctidAccountId, symbolId: chunk });
+          const detRes = await waitFor(ws, 2126, 15000);
+          for (const d of detRes.payload?.symbolDetails ?? []) {
+            const id  = Number(d.symbolId ?? 0);
+            const lot = Number(d.lotSize  ?? 0);
+            const nm  = d.symbolName ?? d.name ?? null;
+            if (id && lot) lotSizes[id] = lot;
+            // Fill in any name the symbol list missed
+            if (id && nm && !symbols[id]) symbols[id] = nm;
+          }
+        }
+        console.log(`[sync] LotSizes fetched: ${Object.keys(lotSizes).length} entries`);
+      } catch (e) {
+        console.warn(`[sync] Symbol details failed (non-fatal): ${e.message}`);
+      }
+    }
+
+    console.log(`[sync] Done: ${allDeals.length} deals, ${Object.keys(symbols).length} symbols, ${Object.keys(lotSizes).length} lotSizes`);
+    return { deals: allDeals, symbols, lotSizes, pages, total: allDeals.length };
+
   } finally {
     ws.terminate();
   }
