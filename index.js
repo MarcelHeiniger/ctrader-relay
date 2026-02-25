@@ -91,11 +91,9 @@ async function syncAccount({ host, clientId, clientSecret, accessToken, ctidAcco
     await waitFor(ws, 2103);
     console.log('[sync] Account auth OK');
 
-    sendMsg(ws, 2119, { ctidTraderAccountId: ctidAccountId, includeArchivedSymbols: false });
-    const symRes  = await waitFor(ws, 2120, 20000);
+    // Symbol names come directly from deal.symbol field — no separate lookup needed
     const symbols = {};
-    for (const s of symRes.payload?.symbol ?? []) symbols[String(s.symbolId)] = s.symbolName;
-    console.log(`[sync] ${Object.keys(symbols).length} symbols`);
+    console.log('[sync] Skipping symbol list (names in deal objects)');
 
     const allDeals = [];
     let   pageFrom = fromTimestamp;
