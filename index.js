@@ -65,7 +65,7 @@ function connectCtrader(host) {
   });
 }
 
-// Framed JSON reader: cTrader uses 4-byte little-endian length + JSON body
+// Framed JSON reader: cTrader JSON port 5036 uses 4-byte BIG-endian length + JSON body
 function createFrameReader(sock) {
   let buf       = Buffer.alloc(0);
   const handlers = [];
@@ -73,7 +73,7 @@ function createFrameReader(sock) {
   sock.on('data', (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     while (buf.length >= 4) {
-      const len = buf.readUInt32LE(0);
+      const len = buf.readUInt32BE(0);  // big-endian on JSON port 5036
       if (len <= 0 || len > 2_000_000) { buf = Buffer.alloc(0); break; }
       if (buf.length < 4 + len) break;
       let msg;
@@ -92,7 +92,7 @@ function createFrameReader(sock) {
 function sendMsg(sock, payloadType, payload) {
   const body  = JSON.stringify({ payloadType, clientMsgId: `tj_${Date.now()}_${Math.random().toString(36).slice(2)}`, payload });
   const frame = Buffer.alloc(4 + body.length);
-  frame.writeUInt32LE(body.length, 0);
+  frame.writeUInt32BE(body.length, 0);  // big-endian on JSON port 5036
   Buffer.from(body).copy(frame, 4);
   sock.write(frame);
 }
