@@ -71,13 +71,26 @@ function createFrameReader(sock) {
   const handlers = [];
 
   sock.on('data', (chunk) => {
+    console.log(`[raw] Received ${chunk.length} bytes: ${chunk.slice(0,40).toString('hex')}`);
     buf = Buffer.concat([buf, chunk]);
     while (buf.length >= 4) {
-      const len = buf.readUInt32BE(0);  // big-endian on JSON port 5036
-      if (len <= 0 || len > 2_000_000) { buf = Buffer.alloc(0); break; }
+      const lenBE = buf.readUInt32BE(0);
+      const lenLE = buf.readUInt32LE(0);
+      console.log(`[frame] buf=${buf.length} lenBE=${lenBE} lenLE=${lenLE}`);
+      const len = lenBE;  // try big-endian first
+      if (len <= 0 || len > 2_000_000) { 
+        console.log(`[frame] Invalid length ${len}, trying LE=${lenLE}`);
+        buf = Buffer.alloc(0); 
+        break; 
+      }
       if (buf.length < 4 + len) break;
+      const raw = buf.slice(4, 4 + len).toString();
+      console.log(`[frame] raw body: ${raw.slice(0, 200)}`);
       let msg;
-      try { msg = JSON.parse(buf.slice(4, 4 + len).toString()); } catch { break; }
+      try { msg = JSON.parse(raw); } catch(e) { 
+        console.log(`[frame] JSON parse error: ${e.message}, raw: ${raw.slice(0,100)}`);
+        break; 
+      }
       buf = buf.slice(4 + len);
       handlers.forEach(fn => fn(msg));
     }
@@ -94,6 +107,7 @@ function sendMsg(sock, payloadType, payload) {
   const frame = Buffer.alloc(4 + body.length);
   frame.writeUInt32BE(body.length, 0);  // big-endian on JSON port 5036
   Buffer.from(body).copy(frame, 4);
+  console.log(`[send] payloadType=${payloadType} len=${body.length} body=${body.slice(0,120)}`);
   sock.write(frame);
 }
 
