@@ -1,20 +1,14 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// cTrader TCP Relay for MyTradeNotes
-// Accepts HTTPS POST from PHP server → connects to cTrader JSON API (port 5036)
-// Deploy free on Render.com
-// ─────────────────────────────────────────────────────────────────────────────
 'use strict';
 
-const tls     = require('tls');
-const express = require('express');
-const app     = express();
+const WebSocket = require('ws');
+const express   = require('express');
+const app       = express();
 
 app.use(express.json({ limit: '2mb' }));
 
 const RELAY_SECRET = process.env.RELAY_SECRET || '';
 const PORT         = process.env.PORT || 3000;
 
-// ── Auth middleware ────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   if (req.path === '/health') return next();
   const secret = req.headers['x-relay-secret'] || req.body?.secret;
@@ -24,176 +18,109 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Health check (keeps Render free tier alive if pinged) ─────────────────────
 app.get('/health', (_, res) => res.json({ ok: true, service: 'ctrader-relay' }));
 
-// ── Main sync endpoint ─────────────────────────────────────────────────────────
-// POST /sync
-// Body: { host, clientId, clientSecret, accessToken, ctidAccountId, fromTimestamp, toTimestamp }
 app.post('/sync', async (req, res) => {
   const { host, clientId, clientSecret, accessToken, ctidAccountId, fromTimestamp, toTimestamp } = req.body;
-
   const missing = ['host','clientId','clientSecret','accessToken','ctidAccountId','fromTimestamp','toTimestamp']
     .filter(k => req.body[k] === undefined || req.body[k] === null || req.body[k] === '');
-  if (missing.length) {
-    return res.json({ ok: false, error: `Missing fields: ${missing.join(', ')}` });
-  }
+  if (missing.length) return res.json({ ok: false, error: `Missing: ${missing.join(', ')}` });
 
   try {
-    const result = await syncAccount({ host, clientId, clientSecret, accessToken,
-                                       ctidAccountId: Number(ctidAccountId),
-                                       fromTimestamp:  Number(fromTimestamp),
-                                       toTimestamp:    Number(toTimestamp) });
+    const result = await syncAccount({
+      host, clientId, clientSecret, accessToken,
+      ctidAccountId: Number(ctidAccountId),
+      fromTimestamp:  Number(fromTimestamp),
+      toTimestamp:    Number(toTimestamp),
+    });
     res.json({ ok: true, ...result });
   } catch (e) {
-    console.error(`[sync] Error: ${e.message}`);
+    console.error(`[sync] ${e.message}`);
     res.json({ ok: false, error: e.message });
   }
 });
 
-// ── TCP helpers ────────────────────────────────────────────────────────────────
-
-function connectCtrader(host) {
+function connectWS(host) {
   return new Promise((resolve, reject) => {
-    const sock = tls.connect({ host, port: 5036, rejectUnauthorized: true }, () => {
-      console.log(`[tcp] Connected to ${host}:5036`);
-      resolve(sock);
-    });
-    sock.setTimeout(12000);
-    sock.on('timeout', () => { sock.destroy(); reject(new Error(`TCP connect timeout to ${host}:5036`)); });
-    sock.on('error',   (e) => reject(new Error(`TCP error: ${e.message}`)));
+    const url = `wss://${host}:5036`;
+    console.log(`[ws] Connecting to ${url}`);
+    const ws = new WebSocket(url);
+    const t  = setTimeout(() => { ws.terminate(); reject(new Error(`WS connect timeout to ${url}`)); }, 12000);
+    ws.on('open',  () => { clearTimeout(t); console.log('[ws] Connected'); resolve(ws); });
+    ws.on('error', (e) => { clearTimeout(t); reject(new Error(`WS error: ${e.message}`)); });
   });
 }
 
-// Framed JSON reader: cTrader JSON port 5036 uses 4-byte BIG-endian length + JSON body
-function createFrameReader(sock) {
-  let buf       = Buffer.alloc(0);
-  const handlers = [];
-
-  sock.on('data', (chunk) => {
-    console.log(`[raw] Received ${chunk.length} bytes: ${chunk.slice(0,40).toString('hex')}`);
-    buf = Buffer.concat([buf, chunk]);
-    while (buf.length >= 4) {
-      const lenBE = buf.readUInt32BE(0);
-      const lenLE = buf.readUInt32LE(0);
-      console.log(`[frame] buf=${buf.length} lenBE=${lenBE} lenLE=${lenLE}`);
-      const len = lenBE;  // try big-endian first
-      if (len <= 0 || len > 2_000_000) { 
-        console.log(`[frame] Invalid length ${len}, trying LE=${lenLE}`);
-        buf = Buffer.alloc(0); 
-        break; 
-      }
-      if (buf.length < 4 + len) break;
-      const raw = buf.slice(4, 4 + len).toString();
-      console.log(`[frame] raw body: ${raw.slice(0, 200)}`);
-      let msg;
-      try { msg = JSON.parse(raw); } catch(e) { 
-        console.log(`[frame] JSON parse error: ${e.message}, raw: ${raw.slice(0,100)}`);
-        break; 
-      }
-      buf = buf.slice(4 + len);
-      handlers.forEach(fn => fn(msg));
-    }
-  });
-
-  return {
-    on:  (fn) => handlers.push(fn),
-    off: (fn) => { const i = handlers.indexOf(fn); if (i >= 0) handlers.splice(i, 1); },
-  };
+function sendMsg(ws, payloadType, payload) {
+  const msg = JSON.stringify({ payloadType, clientMsgId: `tj_${Date.now()}`, payload });
+  console.log(`[send] type=${payloadType} body=${msg.slice(0,120)}`);
+  ws.send(msg);
 }
 
-function sendMsg(sock, payloadType, payload) {
-  const body  = JSON.stringify({ payloadType, clientMsgId: `tj_${Date.now()}_${Math.random().toString(36).slice(2)}`, payload });
-  const frame = Buffer.alloc(4 + body.length);
-  frame.writeUInt32BE(body.length, 0);  // big-endian on JSON port 5036
-  Buffer.from(body).copy(frame, 4);
-  console.log(`[send] payloadType=${payloadType} len=${body.length} body=${body.slice(0,120)}`);
-  sock.write(frame);
-}
-
-function waitFor(reader, wantType, timeoutMs = 12000) {
+function waitFor(ws, wantType, timeoutMs = 12000) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reader.off(handler);
+    const t = setTimeout(() => {
+      ws.off('message', handler);
       reject(new Error(`Timeout waiting for payloadType ${wantType}`));
     }, timeoutMs);
 
-    const handler = (msg) => {
+    function handler(data) {
+      let msg;
+      try { msg = JSON.parse(data.toString()); } catch { return; }
       const pt = Number(msg.payloadType ?? 0);
+      console.log(`[recv] type=${pt} body=${JSON.stringify(msg).slice(0,120)}`);
       if (pt === wantType) {
-        clearTimeout(timer); reader.off(handler); resolve(msg);
-      } else if (pt === 50 || pt === 2142) { // ERROR_RES / ProtoOAErrorRes
-        clearTimeout(timer); reader.off(handler);
-        const desc = msg.payload?.description ?? msg.payload?.errorCode ?? JSON.stringify(msg.payload);
-        reject(new Error(`cTrader error (${pt}): ${desc}`));
+        clearTimeout(t); ws.off('message', handler); resolve(msg);
+      } else if (pt === 50 || pt === 2142) {
+        clearTimeout(t); ws.off('message', handler);
+        reject(new Error(`cTrader error (${pt}): ${msg.payload?.description ?? msg.payload?.errorCode ?? JSON.stringify(msg.payload)}`));
       }
-      // payloadType 51 = heartbeat — ignore
-    };
-    reader.on(handler);
+    }
+    ws.on('message', handler);
   });
 }
 
-// ── Full sync flow ─────────────────────────────────────────────────────────────
 async function syncAccount({ host, clientId, clientSecret, accessToken, ctidAccountId, fromTimestamp, toTimestamp }) {
-  const sock   = await connectCtrader(host);
-  const reader = createFrameReader(sock);
-
+  const ws = await connectWS(host);
   try {
-    // 1. App auth
-    console.log(`[sync] App auth for ctid=${ctidAccountId}`);
-    sendMsg(sock, 2100, { clientId, clientSecret });
-    await waitFor(reader, 2101);
+    sendMsg(ws, 2100, { clientId, clientSecret });
+    await waitFor(ws, 2101);
+    console.log('[sync] App auth OK');
 
-    // 2. Account auth
-    console.log(`[sync] Account auth`);
-    sendMsg(sock, 2102, { ctidTraderAccountId: ctidAccountId, accessToken });
-    await waitFor(reader, 2103);
+    sendMsg(ws, 2102, { ctidTraderAccountId: ctidAccountId, accessToken });
+    await waitFor(ws, 2103);
+    console.log('[sync] Account auth OK');
 
-    // 3. Symbol list
-    console.log(`[sync] Fetching symbols`);
-    sendMsg(sock, 2119, { ctidTraderAccountId: ctidAccountId, includeArchivedSymbols: false });
-    const symRes  = await waitFor(reader, 2120, 15000);
+    sendMsg(ws, 2119, { ctidTraderAccountId: ctidAccountId, includeArchivedSymbols: false });
+    const symRes  = await waitFor(ws, 2120, 20000);
     const symbols = {};
-    for (const s of symRes.payload?.symbol ?? []) {
-      symbols[String(s.symbolId)] = s.symbolName;
-    }
-    console.log(`[sync] Got ${Object.keys(symbols).length} symbols`);
+    for (const s of symRes.payload?.symbol ?? []) symbols[String(s.symbolId)] = s.symbolName;
+    console.log(`[sync] ${Object.keys(symbols).length} symbols`);
 
-    // 4. Deal list (paginated, 500/page)
-    const DEALS_PER_PAGE = 500;
     const allDeals = [];
-    let pageFrom = fromTimestamp;
-    let pages    = 0;
-
+    let   pageFrom = fromTimestamp;
+    let   pages    = 0;
     while (pages < 40) {
-      sendMsg(sock, 2155, {
-        ctidTraderAccountId: ctidAccountId,
-        fromTimestamp: pageFrom,
-        toTimestamp,
-        maxRows: DEALS_PER_PAGE,
-      });
-      const r     = await waitFor(reader, 2156, 20000);
+      sendMsg(ws, 2155, { ctidTraderAccountId: ctidAccountId, fromTimestamp: pageFrom, toTimestamp, maxRows: 500 });
+      const r     = await waitFor(ws, 2156, 20000);
       const deals = r.payload?.deal ?? [];
-      console.log(`[sync] Page ${pages + 1}: ${deals.length} deals`);
+      console.log(`[sync] Page ${pages+1}: ${deals.length} deals`);
       if (!deals.length) break;
       allDeals.push(...deals);
       pages++;
-      if (deals.length < DEALS_PER_PAGE) break;
-      const maxTs = Math.max(...deals.map(d => Number(d.executionTimestamp)));
-      pageFrom = maxTs + 1;
+      if (deals.length < 500) break;
+      pageFrom = Math.max(...deals.map(d => Number(d.executionTimestamp))) + 1;
       if (pageFrom >= toTimestamp) break;
     }
 
-    console.log(`[sync] Done: ${allDeals.length} deals in ${pages} pages`);
+    console.log(`[sync] Done: ${allDeals.length} deals`);
     return { deals: allDeals, symbols, pages, total: allDeals.length };
-
   } finally {
-    sock.destroy();
+    ws.terminate();
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`cTrader relay listening on port ${PORT}`);
-  if (!RELAY_SECRET) console.warn('WARNING: RELAY_SECRET env var not set — relay is unprotected!');
+  console.log(`cTrader relay (WebSocket mode) on port ${PORT}`);
+  if (!RELAY_SECRET) console.warn('WARNING: RELAY_SECRET not set!');
 });
