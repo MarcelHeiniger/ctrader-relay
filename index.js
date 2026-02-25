@@ -99,8 +99,8 @@ async function syncAccount({ host, clientId, clientSecret, accessToken, ctidAcco
     let   pageFrom = fromTimestamp;
     let   pages    = 0;
     while (pages < 40) {
-      sendMsg(ws, 2155, { ctidTraderAccountId: ctidAccountId, fromTimestamp: pageFrom, toTimestamp, maxRows: 500 });
-      const r     = await waitFor(ws, 2156, 20000);
+      sendMsg(ws, 2133, { ctidTraderAccountId: ctidAccountId, fromTimestamp: pageFrom, toTimestamp, maxRows: 500 });
+      const r     = await waitFor(ws, 2134, 20000);
       const deals = r.payload?.deal ?? [];
       console.log(`[sync] Page ${pages+1}: ${deals.length} deals`);
       if (!deals.length) break;
